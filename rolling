@@ -1,0 +1,257 @@
+pipeline {
+    tools {
+        gradle "GRADLE"
+    }
+    agent any
+    stages {
+        stage('Clone') {
+            steps {
+                git branch: 'main', url: 'https://github.com/nayeo2/log-tracking-app.git'
+            }
+        }
+
+        stage('Set Permissions') {
+            steps {
+                sh 'chmod +x ./gradlew'
+            }
+        }
+
+        stage('Test') {
+            steps {
+                script {
+                    sh './gradlew test'
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh './gradlew clean build'
+                script {
+                    def appServerIps = ['10.0.2.79', '10.0.2.67']
+                    copyJarToRemote(appServerIps[0])
+                }
+            }
+        }
+				 stage('Deploy') { // 두 개의 서버에 애플리케이션을 배포하고 Nginx 로드 밸런서를 업데이트합니다.
+				            steps {
+				                script {
+				                    def appServerIps = ['10.0.2.79', '10.0.2.67']
+				                    def nginxIp = '133.186.134.168'
+                    
+			                    // Deploy on first server
+			                    deployOnServer(appServerIps[0], nginxIp)
+			
+			
+			                    // Deploy on second server
+			                    deployOnServer(appServerIps[1], nginxIp)
+
+				                }
+				            }
+				        }
+				  }
+    post {
+        success {
+            echo "Build and deployment succeeded."
+        }
+        failure {
+            echo "Build or deployment failed."
+        }
+    }
+}
+
+
+def copyJarToRemote(targetServerIp) {
+    def jarDirectory = '/var/lib/jenkins/workspace/webhook-pipeline/build/custom-libs/'
+    def jarFilePattern = 'logging-sample-prj-*.jar'
+    def deployPath = '/home/ubuntu'
+
+    sshagent(['A-jenkins-key']) {
+        def scpCmd = "scp -o StrictHostKeyChecking=no ${jarDirectory}${jarFilePattern} ubuntu@$targetServerIp:$deployPath/"
+        def scpResult = sh(script: scpCmd, returnStatus: true)
+        if (scpResult != 0) {
+            error "Failed to copy jar file to $targetServerIp. Exit code: $scpResult"
+        } else {
+            echo "Successfully copied jar file to $targetServerIp"
+        }
+    }
+}
+
+def rollbackToPreviousVersion(targetServerIp, deployPath, checkLogCommand) {
+    def maxAttempts = 10
+    def sleepInterval = 3
+
+    sshagent(['A-jenkins-key']) {
+        // Find the backup JAR file
+        def backupJarFile = sh(script: "ssh -o StrictHostKeyChecking=no ubuntu@$targetServerIp 'ls $deployPath/logging-sample-prj-*-backup.jar'", returnStdout: true).trim()
+
+        if (!backupJarFile) {
+            error "Backup file not found on $targetServerIp"
+        }
+
+        def restoredJarFile = backupJarFile.replace('-backup.jar', '-restored.jar')
+
+        // Restore the backup JAR and start the application
+        def restoreCommand = """
+            mv -f $backupJarFile $restoredJarFile &&
+            nohup java -jar $restoredJarFile > $deployPath/log.log 2>&1 &
+        """
+        sh(script: "ssh -o StrictHostKeyChecking=no ubuntu@$targetServerIp '$restoreCommand'", returnStatus: true)
+
+        def attempts = 0
+        def rollbackSuccess = false
+        while (attempts < maxAttempts) {
+            int result = sh(script: "ssh -o StrictHostKeyChecking=no ubuntu@$targetServerIp '$checkLogCommand'", returnStatus: true)
+            if (result == 0) {
+                echo "Rollback to previous version on $targetServerIp was successful."
+                rollbackSuccess = true
+                break
+            }
+            attempts++
+            sleep sleepInterval
+        }
+
+        if (!rollbackSuccess) {
+            error "Rollback to previous version on $targetServerIp failed."
+        }
+
+        // Cleanup old JAR files
+        def deleteOldJarCmd = "ssh -o StrictHostKeyChecking=no ubuntu@$targetServerIp 'find $deployPath -name \"logging-sample-prj-*.jar\" ! -name \"${restoredJarFile}\" -delete'"
+        def deleteOldJarResult = sh(script: deleteOldJarCmd, returnStatus: true)
+        if (deleteOldJarResult != 0) {
+            error "Failed to delete old JAR files during rollback on $targetServerIp. Exit code: $deleteOldJarResult"
+        } else {
+            echo "Successfully deleted old JAR files during rollback on $targetServerIp."
+        }
+    }
+}
+
+def deployOnServer(ip, nginxIp) {
+    def jarFilePattern = 'logging-sample-prj-*.jar'
+    def deployPath = '/home/ubuntu'
+    def logFile = "$deployPath/log.log"
+    def maxAttempts = 10
+    def sleepInterval = 5
+
+    sshagent(['A-jenkins-key']) {
+        echo "Starting deployment on $ip"
+
+        def jarFile = sh(script: "ssh -o StrictHostKeyChecking=no ubuntu@$ip 'ls $deployPath/$jarFilePattern'", returnStdout: true).trim()
+
+        if (!jarFile) {
+            error "No jar file found for deployment on $ip"
+        }
+
+        def backupJarFile = jarFile.replace('.jar', '-backup.jar')
+
+        def checkBackupCmd = "ssh -o StrictHostKeyChecking=no ubuntu@$ip '[ ! -f $backupJarFile ]'"
+        def checkBackupResult = sh(script: checkBackupCmd, returnStatus: true)
+        if (checkBackupResult == 0) {
+            def backupCmd = "ssh -o StrictHostKeyChecking=no ubuntu@$ip 'cp $jarFile $backupJarFile'"
+            def backupResult = sh(script: backupCmd, returnStatus: true)
+            if (backupResult != 0) {
+                error "Failed to create backup file on $ip. Exit code: $backupResult"
+            }
+        } else {
+            echo "Backup file already exists on $ip"
+        }
+
+        def runAppCommand = "nohup java -jar $jarFile > $logFile 2>&1 &"
+        def runCmd = "ssh -o StrictHostKeyChecking=no ubuntu@$ip '$runAppCommand'"
+        def runResult = sh(script: runCmd, returnStatus: true)
+        if (runResult != 0) {
+            error "Failed to start application on $ip. Exit code: $runResult"
+            rollbackToPreviousVersion(ip, deployPath, "grep -q 'Started' $logFile")
+        }
+
+        def attempts = 0
+        def deploymentSuccess = false
+        while (attempts < maxAttempts) {
+            def statusCode = checkApplicationStatus(ip)
+            if (statusCode == "200") {
+                echo "Deployment to $ip was successful."
+                deploymentSuccess = true
+                break
+            }
+            attempts++
+            sleep sleepInterval
+        }
+
+        if (!deploymentSuccess) {
+            error "Deployment to $ip failed. Rolling back to previous version."
+            rollbackToPreviousVersion(ip, deployPath, "grep -q 'Started' $logFile")
+        }
+
+        def cdTestResult = checkApplicationStatus(ip)
+        echo "CD test result for $ip: '${cdTestResult}'"
+        if (cdTestResult != "200") {
+            error "CD test failed for $ip. Rolling back to previous version."
+            rollbackToPreviousVersion(ip, deployPath, "grep -q 'Started' $logFile")
+        } else {
+            echo "CD test passed for $ip."
+        }
+
+        // Update load balancer
+        updateLoadBalancer(ip, nginxIp, 'add')
+
+        // Cleanup old JAR files
+        def deleteOldJarCmd = "ssh -o StrictHostKeyChecking=no ubuntu@$ip 'find $deployPath -name \"logging-sample-prj-*.jar\" ! -name \"${jarFile}\" -delete'"
+        def deleteOldJarResult = sh(script: deleteOldJarCmd, returnStatus: true)
+        if (deleteOldJarResult != 0) {
+            error "Failed to delete old JAR files on $ip. Exit code: $deleteOldJarResult"
+        } else {
+            echo "Successfully deleted old JAR files on $ip."
+        }
+
+        sleep 10
+    }
+}
+
+def checkApplicationStatus(ip) {
+    def checkStatusCmd = "ssh -o StrictHostKeyChecking=no ubuntu@$ip 'curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8080/products'"
+    def statusCode = sh(script: checkStatusCmd, returnStdout: true).trim()
+    return statusCode
+}
+
+def stopExistingProcess(ip) {
+    // 현재 실행 중인 프로세스를 찾고 종료
+    sshagent(['jenkins-key']) {
+        sh script: """
+            ssh -o StrictHostKeyChecking=no ubuntu@$ip '
+            # Kill the process using the JAR file
+            ps aux | grep logging-sample-prj-*-no_db.jar | grep -v grep | awk "{print \$2}" | xargs sudo kill -9 || true
+            # Kill any process using port 8080
+            sudo lsof -ti:8080 | xargs sudo kill -9 || true
+            '
+        """, returnStatus: true
+    }
+}
+
+
+def updateLoadBalancer(serverIp, nginxIp, action) {
+    def nginxConfigPath = '/etc/nginx/nginx.conf'
+
+    def serverCommand = action == 'remove' ?
+        """
+        ssh -o StrictHostKeyChecking=no ubuntu@$nginxIp 'bash -c "
+            sudo sed -i \\"/server $serverIp:8080/d\\" $nginxConfigPath && \\
+            sudo nginx -t && \\
+            sudo systemctl reload nginx
+        "'
+        """ :
+        """
+        ssh -o StrictHostKeyChecking=no ubuntu@$nginxIp 'bash -c "
+            sudo sed -i \\"/upstream nginx {/a \\
+            \\            server $serverIp:8080 weight=100 max_fails=3 fail_timeout=3s;\\" $nginxConfigPath && \\
+            sudo nginx -t && \\
+            sudo systemctl reload nginx
+        "'
+        """
+
+    def result = sh(script: serverCommand, returnStatus: true)
+    if (result != 0) {
+        error "Failed to ${action == 'remove' ? 'remove' : 'add'} $serverIp ${action == 'remove' ? 'from' : 'to'} load balancer. Exit code: $result"
+    } else {
+        echo "Successfully ${action == 'remove' ? 'removed' : 'added'} $serverIp ${action == 'remove' ? 'from' : 'to'} load balancer"
+    }
+}
