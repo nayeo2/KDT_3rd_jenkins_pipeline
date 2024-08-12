@@ -16,7 +16,7 @@ pipeline {
                     script {
                         // 서버 리스트와 파일 리스트를 변수로 선언합니다.
                         def servers = ['10.0.2.79', '10.0.2.67']
-                        def filesToTransfer = ['log_move.sh', 'log_filter.sh']
+                        def filesToTransfer = ['log_move.sh', 'log_filter.sh', 'load_infile.sh']
                         
                         // 서버 리스트를 순회하며 각 파일을 전송하고 실행합니다.
                         for (server in servers) {
