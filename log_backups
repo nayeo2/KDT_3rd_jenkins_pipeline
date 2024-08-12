@@ -1,0 +1,49 @@
+pipeline {
+    agent any
+    stages {
+        stage('Clone') {
+            steps {
+                git 'https://github.com/nayeo2/KDT_3rd_log_shell.git'
+            }
+        }
+        stage('Build') {
+            steps {
+                sh 'chmod +x log_move.sh'
+                sh './log_move.sh'
+            }
+        }
+        stage('Deploy') {
+            when {
+                expression { currentBuild.result == null || currentBuild.result == 'SUCCESS' }
+            }
+            steps {
+                sshagent(['A-jenkins-key']) {
+                    script {
+                        def servers = [
+                            '10.0.2.79',
+                            '10.0.2.67'
+                        ]
+                        
+                        servers.each { server ->
+                            echo "Deploying to ${server}"
+                            
+                            // Copy the script to the remote server
+                            sh "scp -o StrictHostKeyChecking=no log_move.sh ubuntu@${server}:/home/ubuntu"
+                            
+                            // Execute the script on the remote server
+                            sh "ssh -o StrictHostKeyChecking=no ubuntu@${server} 'chmod +x /home/ubuntu/log_move.sh && /home/ubuntu/log_move.sh'"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        success {
+            echo "Deployment succeeded"
+        }
+        failure {
+            echo "Deployment failed"
+        }
+    }
+}
