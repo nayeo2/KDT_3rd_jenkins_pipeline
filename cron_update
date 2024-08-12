@@ -1,0 +1,39 @@
+pipeline {
+    agent any
+
+    stages {
+        stage('Checkout') {
+            steps {
+                // Git 리포지토리를 클론합니다.
+                git branch: 'main', url: 'https://github.com/nayeo2/KDT_3rd_log_shell.git'
+            }
+        }
+        
+        stage('Transfer and Execute Files') {
+            steps {
+                // SSH 인증을 위해 sshagent를 사용합니다.
+                sshagent(['A-jenkins-key']) {
+                    script {
+                        // 서버 리스트를 변수로 선언합니다.
+                        def servers = ['10.0.2.79', '10.0.2.67']
+                        def fileToTransfer = 'cron_update.sh'
+                        
+                        // 서버 리스트를 순회하며 파일을 전송하고 실행합니다.
+                        for (server in servers) {
+                            // 파일을 서버로 전송합니다.
+                            sh "scp ${fileToTransfer} ubuntu@${server}:/home/ubuntu/"
+                            
+                            // 원격 서버에서 스크립트를 실행합니다.
+                            sh """
+                                ssh ubuntu@${server} '
+                                    chmod +x /home/ubuntu/${fileToTransfer} &&
+                                    /home/ubuntu/${fileToTransfer}
+                                '
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
