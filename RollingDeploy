@@ -1,0 +1,258 @@
+pipeline {
+    tools {
+        gradle "GRADLE" // Jenkins에서 사용할 Gradle 버전을 지정
+    }
+    agent any // Jenkins의 어느 노드에서나 이 파이프라인을 실행할 수 있도록 설정
+    stages {
+        stage('Clone') { // 첫 번째 단계: Git 리포지토리에서 소스 코드를 클론
+            steps {
+                git branch: 'main', url: 'https://github.com/nayeo2/log-tracking-app.git' // 'main' 브랜치에서 소스 코드를 가져옴
+            }
+        }
+
+        stage('Set Permissions') { // 두 번째 단계: Gradle 래퍼 스크립트에 실행 권한 부여
+            steps {
+                sh 'chmod +x ./gradlew' // Gradle 래퍼에 실행 권한을 추가
+            }
+        }
+
+        stage('Test') { // 세 번째 단계: 테스트 실행
+            steps {
+                script {
+                    sh './gradlew test' // Gradle을 사용하여 테스트를 실행
+                }
+            }
+        }
+
+        stage('Build') { // 네 번째 단계: 애플리케이션 빌드
+            steps {
+                script {
+                    def jarFilePattern = '/var/lib/jenkins/workspace/rolling-app/build/custom-libs/logging-sample-prj-*no_db.jar' // 빌드된 JAR 파일의 경로 패턴 설정
+                    def jarFile = sh(script: "ls $jarFilePattern | grep -v plain", returnStdout: true).trim() // JAR 파일의 경로를 확인
+                    echo "Built JAR file: $jarFile" // 빌드된 JAR 파일 경로 출력
+                    env.JAR_FILE = jarFile // 빌드된 JAR 파일 경로를 환경 변수에 저장
+                }
+            }
+        }
+
+        stage('Deploy') { // 다섯 번째 단계: 빌드된 애플리케이션을 서버에 배포
+            steps {
+                script {
+                    def appServerIps = ['10.0.2.79', '10.0.2.67'] // 애플리케이션 서버 IP 목록
+                    def nginxIp = '10.0.10.95' // Nginx 서버 IP 주소
+
+                    copyJarToRemote(appServerIps[0], env.JAR_FILE) // 첫 번째 서버에 JAR 파일 복사
+                    
+                    // 첫 번째 서버에 애플리케이션 배포
+                    deployOnServer(appServerIps[0], nginxIp)
+
+                    // 두 번째 서버로 JAR 파일 복사
+                    copyJarToRemote(appServerIps[1], env.JAR_FILE)
+
+                    // 두 번째 서버에 애플리케이션 배포
+                    deployOnServer(appServerIps[1], nginxIp)
+                }
+            }
+        }
+    }
+    post {
+        success {
+            echo "Build and deployment succeeded." // 빌드 및 배포 성공 시 메시지 출력
+        }
+        failure {
+            echo "Build or deployment failed." // 빌드 또는 배포 실패 시 메시지 출력
+        }
+    }
+}
+
+// JAR 파일을 원격 서버로 복사하는 함수
+def copyJarToRemote(targetServerIp, jarFile) {
+    def deployPath = '/home/ubuntu' // JAR 파일을 복사할 원격 서버 경로
+
+    sshagent(['A-jenkins-key']) { // SSH 에이전트를 사용하여 인증
+        def scpCmd = "scp -o StrictHostKeyChecking=no $jarFile ubuntu@$targetServerIp:$deployPath/" // SCP를 사용하여 원격 서버로 JAR 파일 복사
+        def scpResult = sh(script: scpCmd, returnStatus: true) // SCP 명령을 실행하고 결과를 확인
+        if (scpResult != 0) {
+            error "Failed to copy jar file to $targetServerIp" // SCP 실패 시 에러 출력
+        } else {
+            echo "Successfully copied jar file to $targetServerIp" // SCP 성공 시 메시지 출력
+        }
+    }
+}
+
+// 애플리케이션을 서버에 배포하는 함수
+def deployOnServer(ip, nginxIp) {
+    def deployPath = '/home/ubuntu' // JAR 파일이 위치할 원격 서버 경로
+    def jarFilePattern = "logging-sample-prj-*-no_db.jar" // 배포할 JAR 파일 패턴
+    def runAppCommand = "nohup java -jar $deployPath/$jarFilePattern > $deployPath/log.log 2>&1 &" // JAR 파일 실행 명령
+    def checkLogCommand = "grep -q 'Started' $deployPath/log.log" // 애플리케이션 시작 여부를 확인하는 명령
+    def backupJarFile = 'logging-sample-prj-backup.jar' // 백업 파일 이름
+    def maxAttempts = 10 // 로그 확인 시도 횟수
+    def sleepInterval = 5 // 로그 확인 간격
+
+    sshagent(['A-jenkins-key']) { // SSH 에이전트를 사용하여 인증
+        echo "Starting deployment on $ip" // 배포 시작 메시지 출력
+
+        stopExistingProcess(ip) // 1. 기존 실행 중인 프로세스를 종료
+
+        // 2. 백업 파일 생성 (존재하지 않는 경우)
+        def backupCmd = """
+            ssh -o StrictHostKeyChecking=no ubuntu@$ip '
+            jarFile=\$(find $deployPath -name "$jarFilePattern" | head -n 1) // JAR 파일 경로 찾기
+            if [ -n "\$jarFile" ]; then
+                if [ ! -f $deployPath/$backupJarFile ]; then // 백업 파일이 없을 경우 백업 생성
+                    cp "\$jarFile" "$deployPath/$backupJarFile"
+                    echo "Backup created: $deployPath/$backupJarFile"
+                else
+                    echo "Backup file already exists on $ip" // 백업 파일이 이미 존재할 경우 메시지 출력
+                fi
+            else
+                echo "No JAR file found to back up" // 백업할 JAR 파일이 없을 경우 메시지 출력
+            fi
+            '
+        """
+        def backupResult = sh(script: backupCmd, returnStatus: true) // 백업 명령 실행
+        if (backupResult != 0) {
+            error "Failed to create backup file on $ip" // 백업 실패 시 에러 출력
+        }
+
+        // 3. 새로운 버전 배포
+        def runCmd = "ssh -o StrictHostKeyChecking=no ubuntu@$ip '$runAppCommand'" // 애플리케이션 실행 명령
+        def runResult = sh(script: runCmd, returnStatus: true) // 애플리케이션 실행 명령 실행
+        if (runResult != 0) {
+            error "Failed to start application on $ip" // 애플리케이션 실행 실패 시 에러 출력
+            rollbackToPreviousVersion(ip, backupJarFile, deployPath, runAppCommand, checkLogCommand) // 롤백 실행
+        }
+
+        // 4. 새로운 버전의 애플리케이션이 성공적으로 시작되었는지 확인
+        def attempts = 0
+        def deploymentSuccess = false
+        while (attempts < maxAttempts) { // 로그 확인을 통해 애플리케이션 시작 여부 확인
+            int result = sh(script: "ssh -o StrictHostKeyChecking=no ubuntu@$ip '$checkLogCommand'", returnStatus: true)
+            if (result == 0) {
+                echo "Deployment to $ip was successful." // 배포 성공 시 메시지 출력
+                deploymentSuccess = true
+                break
+            }
+            attempts++
+            sleep sleepInterval
+        }
+
+        if (!deploymentSuccess) {
+            error "Deployment to $ip failed. Rolling back to previous version." // 배포 실패 시 메시지 출력 후 롤백 실행
+            rollbackToPreviousVersion(ip, backupJarFile, deployPath, runAppCommand, checkLogCommand)
+        }
+
+        // 5. CD 테스트 실행
+        def cdTestResult = checkApplicationStatus(ip) // 애플리케이션 상태 확인
+        echo "CD test result for $ip: '${cdTestResult}'" // CD 테스트 결과 출력
+        if (cdTestResult != "200") {
+            error "CD test failed for $ip. Rolling back to previous version." // CD 테스트 실패 시 메시지 출력 후 롤백 실행
+            rollbackToPreviousVersion(ip, backupJarFile, deployPath, runAppCommand, checkLogCommand)
+        } else {
+            echo "CD test passed for $ip." // CD 테스트 성공 시 메시지 출력
+        }
+
+        // 6. 로드 밸런서에 새로운 서버 IP 추가
+        updateLoadBalancer(ip, nginxIp, 'add') // 로드 밸런서에 서버 IP 추가
+
+        // 다음 서버로 넘어가기 전 안정성을 위해 잠시 대기
+        sleep 10
+    }
+}
+
+// 기존 실행 중인 프로세스를 종료하는 함수
+def stopExistingProcess(ip) {
+    // 현재 실행 중인 프로세스를 찾고 종료
+    sshagent(['A-jenkins-key']) {
+        sh script: """
+            ssh -o StrictHostKeyChecking=no ubuntu@$ip '
+            # Kill the process using the JAR file
+            ps aux | grep logging-sample-prj-*-no_db.jar | grep -v grep | awk "{print \$2}" | xargs sudo kill -9 || true
+            # Kill any process using port 8080
+            sudo lsof -ti:8080 | xargs sudo kill -9 || true
+            '
+        """, returnStatus: true
+    }
+}
+
+// 애플리케이션 상태를 확인하는 함수
+def checkApplicationStatus(ip) {
+    def checkStatusCmd = "ssh -o StrictHostKeyChecking=no ubuntu@$ip 'curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8080/products'" // HTTP 상태 코드 확인 명령
+    def statusCode = sh(script: checkStatusCmd, returnStdout: true).trim() // 상태 코드 확인
+    return statusCode // 상태 코드 반환
+}
+
+// 배포 실패 시 이전 버전으로 롤백하는 함수
+def rollbackToPreviousVersion(targetServerIp, backupJarFile, deployPath, runAppCommand, checkLogCommand) {
+    def maxAttempts = 10 // 롤백 시도 횟수
+    def sleepInterval = 3 // 롤백 확인 간격
+
+    sshagent(['A-jenkins-key']) { // SSH 에이전트를 사용하여 인증
+        sh script: "ssh -o StrictHostKeyChecking=no ubuntu@$targetServerIp 'pgrep -f logging-sample-prj-*-no_db.jar && pkill -f logging-sample-prj-*-no_db.jar || echo \"No process found\"'", returnStatus: true // 기존 프로세스 종료
+
+        // 백업 파일을 이전 버전으로 복원
+        sh script: """
+            ssh -o StrictHostKeyChecking=no ubuntu@$targetServerIp 'if [ -f $deployPath/$backupJarFile ]; then
+                mv -f $deployPath/$backupJarFile $deployPath/logging-sample-prj-*-no_db.jar
+                $runAppCommand
+            else
+                echo "Backup file not found on $targetServerIp"
+                exit 1
+            fi'
+        """, returnStatus: true
+
+        // 복원된 버전이 성공적으로 시작되었는지 확인
+        def attempts = 0
+        def rollbackSuccess = false
+        while (attempts < maxAttempts) {
+            int result = sh(script: "ssh -o StrictHostKeyChecking=no ubuntu@$targetServerIp '$checkLogCommand'", returnStatus: true)
+            if (result == 0) {
+                echo "Rollback to previous version on $targetServerIp was successful." // 롤백 성공 시 메시지 출력
+                rollbackSuccess = true
+                break
+            }
+            attempts++
+            sleep sleepInterval
+        }
+
+        if (!rollbackSuccess) {
+            error "Rollback to previous version on $targetServerIp failed." // 롤백 실패 시 에러 출력
+        }
+    }
+}
+
+// 로드 밸런서에서 서버 IP를 추가/제거하는 함수
+def updateLoadBalancer(serverIp, nginxIp, action) {
+    def nginxConfigPath = '/etc/nginx/nginx.conf' // Nginx 설정 파일 경로
+
+    def serverCommand = action == 'remove' ? // IP 제거 또는 추가 명령 설정
+        """
+        ssh -o StrictHostKeyChecking=no ubuntu@$nginxIp 'bash -c "
+        # 서버 IP 제거
+        sudo sed -i \\"/server $serverIp:8080/d\\" $nginxConfigPath && \\
+        # Nginx 구성을 테스트
+        sudo nginx -t && \\
+        # Nginx를 재로드
+        sudo systemctl reload nginx
+        "'
+        """ :
+        """
+        ssh -o StrictHostKeyChecking=no ubuntu@$nginxIp 'bash -c "
+        # 서버 IP 추가
+        sudo sed -i \\"/upstream nginx {/a \\
+        \\            server $serverIp:8080 weight=100 max_fails=3 fail_timeout=3s;\\" $nginxConfigPath && \\
+        # Nginx 구성을 테스트
+        sudo nginx -t && \\
+        # Nginx를 재로드
+        sudo systemctl reload nginx
+        "'
+        """
+
+    def result = sh(script: serverCommand, returnStatus: true) // 명령 실행 및 결과 확인
+    if (result != 0) {
+        error "Failed to ${action == 'remove' ? 'remove' : 'add'} $serverIp ${action == 'remove' ? 'from' : 'to'} load balancer" // 실패 시 에러 출력
+    } else {
+        echo "Successfully ${action == 'remove' ? 'removed' : 'added'} $serverIp ${action == 'remove' ? 'from' : 'to'} load balancer" // 성공 시 메시지 출력
+    }
+}
