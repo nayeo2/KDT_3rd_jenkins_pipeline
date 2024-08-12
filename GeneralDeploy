@@ -1,0 +1,68 @@
+def deployApp(targetServerIp, jarName) {
+    def deployPath = '/home/ubuntu'
+    def runAppCommand = "nohup java -jar $deployPath/$jarName > nohup.log 2>&1 &"
+        
+    sshagent(['A-jenkins-key']) {
+        // 이전에 실행한 프로세스 종료
+        sh "ssh -o StrictHostKeyChecking=no ubuntu@$targetServerIp 'ps -ef | grep java | grep -v grep | awk \"{print \\\$2}\" | xargs -r sudo kill -9 || echo \"No process found\"'"
+
+        // 기존 JAR 파일 삭제
+        sh "ssh -o StrictHostKeyChecking=no ubuntu@$targetServerIp 'rm -f $deployPath/logging-sample-prj-*-no_db.jar'"
+
+        // JAR 파일 배포
+        sh "scp -o StrictHostKeyChecking=no build/custom-libs/$jarName ubuntu@$targetServerIp:$deployPath/"
+        sh "ssh -o StrictHostKeyChecking=no ubuntu@$targetServerIp '$runAppCommand'"
+    }
+}
+
+pipeline {
+    tools {
+        gradle "GRADLE"
+    }
+
+    agent any
+    stages {
+        stage('Clone') {
+            steps {
+                git branch: 'main', 
+                    url: 'https://github.com/dev-library/log-tracking-app.git'
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh 'chmod +x ./gradlew'
+                sh './gradlew clean build'
+                sh 'ls -la build/custom-libs' // 빌드된 파일 리스트 출력
+            }
+        }
+        
+        stage('Find JAR') {
+            steps {
+                script {
+                    def jarName = sh(script: "ls build/custom-libs | grep 'logging-sample-prj-.*-no_db.jar'", returnStdout: true).trim()
+                    if (!jarName) {
+                        error "JAR file not found"
+                    }
+                    env.JAR_NAME = jarName
+                }
+            }
+        }
+
+        stage('Deploy app-1') {
+            steps {
+                script {
+                    deployApp('10.0.2.79', env.JAR_NAME)
+                }
+            }
+        }
+    }
+    post {
+        success {
+            echo "This will run when the run finished successfully"
+        }
+        failure {
+            echo "This will run if failed"
+        }
+    }
+}
