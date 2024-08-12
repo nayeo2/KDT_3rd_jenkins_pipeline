@@ -17,7 +17,8 @@ pipeline {
                         // 서버 리스트와 파일 리스트를 변수로 선언합니다.
                         def servers = ['10.0.2.79', '10.0.2.67']
                         def filesToTransfer = ['log_move.sh', 'log_filter.sh', 'load_infile.sh']
-                        
+                         def logrotateConf = 'logrotate.conf'
+                         
                         // 서버 리스트를 순회하며 각 파일을 전송하고 실행합니다.
                         for (server in servers) {
                             // 각 파일을 서버로 전송합니다.
@@ -31,6 +32,17 @@ pipeline {
                                         /home/ubuntu/${fileToTransfer}
                                     '
                                 """
+                                
+                                // logrotate 구성 파일을 서버로 전송합니다.
+		                            sh "scp ${logrotateConf} ubuntu@${server}:/home/ubuntu/"
+		
+		                            // 원격 서버에서 logrotate 구성을 적용합니다.
+		                            sh """
+		                                ssh ubuntu@${server} '
+		                                    sudo mv /home/ubuntu/${logrotateConf} /etc/logrotate.d/ &&
+		                                    sudo logrotate -f /etc/logrotate.d/${logrotateConf}
+		                                '
+		                            """
                             }
                         }
                     }
